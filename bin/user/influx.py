@@ -1,130 +1,6 @@
-# Copyright 2016-2021 Matthew Wall
-# Distributed under the terms of the GNU Public License (GPLv3)
-
 """
 Influx is a platform for collecting, storing, and managing time-series data.
-
-http://influxdata.com
-
-This is a weewx extension that uploads data to an Influx server.
-
-Database Configuration and Access
-
-When it starts up, this extension will attempt to create the influx database.
-
-To disable database creation, set create_database=False.
-
-If credentials for a database administrator were provided, it will use those
-credentials.  Otherwise, it will use the username/password credentials.
-
-All other access to the influx database uses the username/password credentials
-(non database administrator), if provided.
-
-Minimal Configuration
-
-A database name is required.  All weewx variables will be uploaded using weewx
-names and default units and formatting.
-
-[StdRESTful]
-    [[Influx]]
-        host = influxservername.example.com
-        database = DATABASE
-
-Customization: line format and database structure
-
-This uploader supports a few formats, using either the single- or multi-line
-format in influx.  Options for this parameter include:  multi-line,
-multi-line-dotted, and single-line.  The default is single-line.
-
-[StdRESTful]
-    [[Influx]]
-        measurement = weewx
-        line_format = multi-line-dotted
-
-Here are examples of the data sent to influx when the 'measurement' parameter
-is set to 'weewx'.
-
-The single-line format results in the following:
-
-  weewx[tags] name0=x,name1=y,name2=z ts
-
-The multi-line format results in the following:
-
-  name0[tags] value=x ts
-  name1[tags] value=y ts
-  name2[tags] value=z ts
-
-The multi-line-dotted format results in the following:
-
-  weewx.name0[tags] value=x ts
-  weewx.name1[tags] value=x ts
-  weewx.name2[tags] value=x ts
-
-Which format should you use?  It depends on how you want the data to end up in
-influx.  For influx, think of measurement name as table, tags as column names,
-and fields as unindexed columns.
-
-For example, consider these data points:
-
-{'H19': 528, 'VPV': 63.68, 'I': 600, 'H21': 115, 'H20': 19, 'H23': 93, 'H22': 23, 'V': 13.41, 'CS': 5, 'PPV': 9}
-{'H19': 528, 'VPV': 63.68, 'I': 600, 'H21': 115, 'H20': 19, 'H23': 93, 'H22': 23, 'V': 14.43, 'CS': 5, 'PPV': 9}
-{'H19': 528, 'VPV': 63.71, 'I': 600, 'H21': 115, 'H20': 19, 'H23': 93, 'H22': 23, 'V': 13.43, 'CS': 5, 'PPV': 9}
-{'H19': 528, 'VPV': 63.74, 'I': 600, 'H21': 115, 'H20': 19, 'H23': 93, 'H22': 23, 'V': 13.43, 'CS': 5, 'PPV': 9}
-
-A single-line configuration results in this:
-
-> select * from value
-name: value
-time                CS H19 H20 H21 H22 H23 I   PPV V     VPV   binding
-----                -- --- --- --- --- --- -   --- -     ---   -------
-1536086335000000000 5  528 19  115 23  93  0.6 9   13.41 63.68 loop   
-1536086337000000000 5  528 19  115 23  93  0.6 9   13.43 63.68 loop   
-1536086339000000000 5  528 19  115 23  93  0.6 9   13.43 63.71 loop   
-1536086341000000000 5  528 19  115 23  93  0.6 9   13.43 63.74 loop   
-
-A multi-line configuration results in this:
-
-> select * from VPV
-name: value
-time                VPV
-----                ---
-1536086335000000000 63.68
-1536086337000000000 63.68
-1536086339000000000 63.71
-1536086341000000000 63.74
-
-Customization: controlling which variables are uploaded
-
-When an input map is specified, only variables in that map will be uploaded.
-The 'units' parameter can be used to specify which units should be used for
-the input, independent of the local weewx units.
-
-[StdRESTful]
-    [[Influx]]
-        database = DATABASE
-        host = localhost
-        port = 8086
-        tags = station=A
-        [[[inputs]]]
-            [[[[barometer]]]]
-                units = inHg
-                name = barometer_inHg
-                format = %.3f
-            [[[[outTemp]]]]
-                units = degree_F
-                name = outTemp_F
-                format = %.1f
-            [[[[outHumidity]]]]
-                name = outHumidity
-                format = %03.0f
-            [[[[windSpeed]]]]
-                units = mph
-                name = windSpeed_mph
-                format = %.2f
-            [[[[windDir]]]]
-                format = %03.0f
 """
-
 import queue
 import base64
 from distutils.version import StrictVersion
@@ -137,11 +13,11 @@ from urllib.error import HTTPError, URLError
 import weewx
 import weewx.restx
 import weewx.units
-from weeutil.weeutil import to_bool, accumulateLeaves
+from weeutil.weeutil import to_bool
 
 VERSION = "0.17"
 
-REQUIRED_WEEWX = "3.5.0"
+REQUIRED_WEEWX = "5.1.0"
 if StrictVersion(weewx.__version__) < StrictVersion(REQUIRED_WEEWX):
     raise weewx.UnsupportedFeature("weewx %s or greater is required, found %s"
                                    % (REQUIRED_WEEWX, weewx.__version__))
@@ -419,7 +295,7 @@ class InfluxThread(weewx.restx.RESTThread):
             self.create_database(uname, pword)
 
     def create_database(self, username, password):
-        # ensure that the database exists
+        """ensure that the database exists"""
         qstr = urlencode({'q': 'CREATE DATABASE %s' % self.database})
         url = '%s/query?%s' % (self.server_url, qstr)
         req = Request(url)
@@ -436,11 +312,13 @@ class InfluxThread(weewx.restx.RESTThread):
         except (socket.error, socket.timeout, URLError, http_client.BadStatusLine, http_client.IncompleteRead) as e:
             logerr("create database failed: %s" % e)
 
-    def get_record(self, record, dbm):
-        # We allow the superclass to add stuff to the record only if the user
-        # requests it
-        if self.augment_record and dbm:
-            record = super(InfluxThread, self).get_record(record, dbm)
+    def get_record(self, record, dbmanager):
+        """
+        We allow the superclass to add stuff to the record only if the user
+        requests it
+        """
+        if self.augment_record and dbmanager:
+            record = super(InfluxThread, self).get_record(record, dbmanager)
         if self.unit_system is not None:
             record = weewx.units.to_std_system(record, self.unit_system)
         return record
@@ -480,16 +358,17 @@ class InfluxThread(weewx.restx.RESTThread):
                     raise weewx.restx.AbortedPost(payload)
         super(InfluxThread, self).handle_exception(e, count)
 
-    def post_request(self, request, payload=None):
+    def post_request(self, request, data=None):
+        """Post the request to the server"""
         # FIXME: provide full set of ssl options instead of this hack
         if self.server_url.startswith('https'):
             import ssl
             encoded = None
-            if payload:
-                encoded = payload.encode('utf-8')
+            if data:
+                encoded = data.encode('utf-8')
             return urlopen(request, data=encoded, timeout=self.timeout,
                            context=ssl._create_unverified_context())
-        return super(InfluxThread, self).post_request(request, payload)
+        return super(InfluxThread, self).post_request(request, data)
 
     def get_post_body(self, record):
         """Override my superclass and get the body of the POST"""
@@ -527,9 +406,9 @@ class InfluxThread(weewx.restx.RESTThread):
         # loop through the templates, populating them with data from the
         # record.
         data = []
-        for k in self.templates:
+        for k, v in self.templates.items():
             try:
-                v = float(record.get(k))
+                v = float(v)
                 name = self.templates[k].get('name', k)
                 fmt = self.templates[k].get('format', '%s')
                 to_units = self.templates[k].get('units')
@@ -565,7 +444,7 @@ class InfluxThread(weewx.restx.RESTThread):
 #   PYTHONPATH=bin python bin/user/influx.py
 
 if __name__ == "__main__":
-    import optparse
+    from argparse import ArgumentParser
     import time
 
     weewx.debug = 2
@@ -578,31 +457,31 @@ if __name__ == "__main__":
                         [--database=DBNAME] [--measurement=MEASUREMENT]
                         [--tags=TAGS]"""
 
-    parser = optparse.OptionParser(usage=usage)
-    parser.add_option('--version', action='store_true',
+    parser = ArgumentParser(usage=usage)
+    parser.add_argument('--version', action='store_true',
                       help='Display weewx-influx version')
-    parser.add_option('--server-url', default='http://localhost:8086',
+    parser.add_argument('--server-url', default='http://localhost:8086',
                       help="URL for the InfluxDB server. Default is 'http://localhost:8086'",
                       metavar="SERVER-URL")
-    parser.add_option('--user', default='weewx',
+    parser.add_argument('--user', default='weewx',
                       help="User name to be used for data posts. Default is 'weewx'",
                       metavar="USER")
-    parser.add_option('--password', default='weewx',
+    parser.add_argument('--password', default='weewx',
                       help="Password for USER. Default is 'weewx'",
                       metavar="PASSWORD")
-    parser.add_option('--admin-user',
+    parser.add_argument('--admin-user',
                       help="Admin user to be used when creating the database.",
                       metavar="ADMIN-USER")
-    parser.add_option('--admin-password',
+    parser.add_argument('--admin-password',
                       help="Password for ADMIN-USER.",
                       metavar="ADMIN-PASSWORD")
-    parser.add_option('--database', default='tester',
+    parser.add_argument('--database', default='tester',
                       help="InfluxDB database name. Default is 'tester'",
                       metavar="DBNAME")
-    parser.add_option('--measurement', default='record',
+    parser.add_argument('--measurement', default='record',
                       help="InfluxDB measurement name. Default is 'record'",
                       metavar="MEASUREMENT")
-    parser.add_option('--tags', default='station=A,field=C',
+    parser.add_argument('--tags', default='station=A,field=C',
                       help="Influxdb tags to be used. Default is 'station=A,field=C'",
                       metavar="TAGS")
     (options, args) = parser.parse_args()
