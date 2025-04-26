@@ -125,33 +125,14 @@ the input, independent of the local weewx units.
                 format = %03.0f
 """
 
-try:
-    # Python 3
-    import queue
-except ImportError:
-    # Python 2
-    import Queue as queue
+import queue
 import base64
 from distutils.version import StrictVersion
-try:
-    # Python 3
-    import http.client as http_client
-except ImportError:
-    # Python 2
-    import httplib as http_client
+import http.client as http_client
 import socket
-try:
-    # Python 3
-    from urllib.parse import urlparse, urlencode
-    from urllib.request import urlopen, Request
-    from urllib.error import HTTPError, URLError
-except ImportError:
-    # Python 2
-    from urlparse import urlparse
-    from urllib import urlencode
-    from urllib2 import urlopen, Request, HTTPError, URLError
-    from httplib import BadStatusLine
-import sys
+from urllib.parse import urlencode
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
 
 import weewx
 import weewx.restx
