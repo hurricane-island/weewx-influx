@@ -4,9 +4,9 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-weewx = "5.1.0"
 
 [dev-packages]
+weewx = "5.1.0"
 
 [requires]
 python_version = "3.9"

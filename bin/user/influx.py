@@ -1,104 +1,64 @@
 """
 Influx is a platform for collecting, storing, and managing time-series data.
 """
-import queue
-import base64
+from queue import Queue
+from logging import getLogger
 from distutils.version import StrictVersion
-import http.client as http_client
-import socket
-from urllib.parse import urlencode
-from urllib.request import urlopen, Request
-from urllib.error import HTTPError, URLError
-
+from urllib.request import urlopen
+from urllib.error import HTTPError
 import weewx
-import weewx.restx
-import weewx.units
+from weewx.restx import RESTThread, FailedPost, AbortedPost, StdRESTbase, get_site_dict
+from weewx.units import convert, getStandardUnitType, unit_constants, to_std_system
 from weeutil.weeutil import to_bool
 
-VERSION = "0.17"
 
 REQUIRED_WEEWX = "5.1.0"
 if StrictVersion(weewx.__version__) < StrictVersion(REQUIRED_WEEWX):
-    raise weewx.UnsupportedFeature("weewx %s or greater is required, found %s"
-                                   % (REQUIRED_WEEWX, weewx.__version__))
+    raise weewx.UnsupportedFeature(
+        f"weewx {REQUIRED_WEEWX} or greater is required, found {weewx.__version__}"
+    )
+log = getLogger(__name__)
 
-try:
-    # Test for new-style weewx logging by trying to import weeutil.logger
-    import weeutil.logger
-    import logging
-    log = logging.getLogger(__name__)
-
-    def logdbg(msg):
-        log.debug(msg)
-
-    def loginf(msg):
-        log.info(msg)
-
-    def logerr(msg):
-        log.error(msg)
-
-except ImportError:
-    # Old-style weewx logging
-    import syslog
-
-    def logmsg(level, msg):
-        syslog.syslog(level, 'restx: Influx: %s' % msg)
-
-    def logdbg(msg):
-        logmsg(syslog.LOG_DEBUG, msg)
-
-    def loginf(msg):
-        logmsg(syslog.LOG_INFO, msg)
-
-    def logerr(msg):
-        logmsg(syslog.LOG_ERR, msg)
-
-# some unit labels are rather lengthy.  this reduces them to something shorter.
+# Shorten unit names for InfluxDB
 UNIT_REDUCTIONS = {
-    'degree_F': 'F',
-    'degree_C': 'C',
-    'inch': 'in',
-    'mile_per_hour': 'mph',
-    'mile_per_hour2': 'mph',
-    'km_per_hour': 'kph',
-    'km_per_hour2': 'kph',
-    'knot': 'knot',
-    'knot2': 'knot',
-    'meter_per_second': 'mps',
-    'meter_per_second2': 'mps',
-    'degree_compass': None,
-    'watt_per_meter_squared': 'Wpm2',
-    'uv_index': None,
-    'percent': None,
-    'unix_epoch': None,
+    "degree_F": "F",
+    "degree_C": "C",
+    "inch": "in",
+    "mile_per_hour": "mph",
+    "mile_per_hour2": "mph",
+    "km_per_hour": "kph",
+    "km_per_hour2": "kph",
+    "knot": "knot",
+    "knot2": "knot",
+    "meter_per_second": "mps",
+    "meter_per_second2": "mps",
+    "degree_compass": None,
+    "watt_per_meter_squared": "Wpm2",
+    "uv_index": None,
+    "percent": None,
+    "unix_epoch": None,
 }
-
 # observations that should be skipped when obs_to_upload is 'most'
-OBS_TO_SKIP = ['dateTime', 'interval', 'usUnits']
-
+OBS_TO_SKIP = ["dateTime", "interval", "usUnits"]
 MAX_SIZE = 1000000
 
-# return the units label for an observation
-def _get_units_label(obs, unit_system, unit_type=None):
-    if unit_type is None:
-        (unit_type, _) = weewx.units.getStandardUnitType(unit_system, obs)
-    return UNIT_REDUCTIONS.get(unit_type, unit_type)
-
-# get the template for an observation based on the observation key
-def _get_template(obs_key, overrides, append_units_label, unit_system):
-    tmpl_dict = dict()
+def _get_template(obs_key: str, overrides: dict, append_units_label: bool, unit_system):
+    """get the template for an observation based on the observation key"""
+    template = {}
     if append_units_label:
-        unit_type = overrides.get('units')
-        label = _get_units_label(obs_key, unit_system, unit_type)
+        unit_type = overrides.get("units")
+        if unit_type is None:
+            unit_type, _ = getStandardUnitType(unit_system, obs_key)
+        label = UNIT_REDUCTIONS.get(unit_type, unit_type)
         if label is not None:
-            tmpl_dict['name'] = "%s_%s" % (obs_key, label)
-    for x in ['name', 'format', 'units']:
+            template["name"] = f"{obs_key}_{label}"
+    for x in ["name", "format", "units"]:
         if x in overrides:
-            tmpl_dict[x] = overrides[x]
-    return tmpl_dict
+            template[x] = overrides[x]
+    return template
 
-
-class Influx(weewx.restx.StdRESTbase):
+class Influx(StdRESTbase):
+    """REST implementation for InfluxDB"""
     def __init__(self, engine, cfg_dict):
         """This service recognizes standard restful options plus the following:
 
@@ -124,9 +84,6 @@ class Influx(weewx.restx.StdRESTbase):
         measurement.  tags cannot contain spaces.
         Default is None
 
-        create_database: should the upload attempt to create database first
-        Default is True
-
         line_format: which line protocol format to use.  Possible values are
         single-line, multi-line, or multi-line-dotted.
         Default is single-line
@@ -147,364 +104,279 @@ class Influx(weewx.restx.StdRESTbase):
         binding: options include "loop", "archive", or "loop,archive"
         Default is archive
         """
-        super(Influx, self).__init__(engine, cfg_dict)
-        loginf("service version is %s" % VERSION)
-        site_dict = weewx.restx.get_site_dict(cfg_dict, 'Influx', 'database')
+        super().__init__(engine, cfg_dict)
+        site_dict = get_site_dict(cfg_dict, "Influx", "database")
         if site_dict is None:
             return
+        site_dict.setdefault("api_token", "")
+        site_dict.setdefault("tags", None)
+        site_dict.setdefault("line_format", "single-line")
+        site_dict.setdefault("obs_to_upload", "most")
+        site_dict.setdefault("append_units_label", True)
+        site_dict.setdefault("augment_record", True)
+        site_dict.setdefault("measurement", "record")
 
+        log.info("database: %s", site_dict["database"])
+        log.info("destination: %s", site_dict["server_url"])
+        log.info("line_format: %s", site_dict["line_format"])
+        log.info("measurement: %s", site_dict["measurement"])
 
-        port = int(site_dict.get('port', 8086))
-        host = site_dict.get('host', 'localhost')
-        if site_dict.get('server_url', None) is None:
-            site_dict['server_url'] = 'http://%s:%s' % (host, port)
-        site_dict.pop('host', None)
-        site_dict.pop('port', None)
-        site_dict.setdefault('username', None)
-        site_dict.setdefault('password', '')
-        site_dict.setdefault('dbadmin_username', None)
-        site_dict.setdefault('dbadmin_password', '')
-        site_dict.setdefault('create_database', True)
-        site_dict.setdefault('tags', None)
-        site_dict.setdefault('line_format', 'single-line')
-        site_dict.setdefault('obs_to_upload', 'most')
-        site_dict.setdefault('append_units_label', True)
-        site_dict.setdefault('augment_record', True)
-        site_dict.setdefault('measurement', 'record')
+        site_dict["append_units_label"] = to_bool(site_dict.get("append_units_label"))
+        site_dict["augment_record"] = to_bool(site_dict.get("augment_record"))
 
-        loginf("database: %s" % site_dict['database'])
-        loginf("destination: %s" % site_dict['server_url'])
-        loginf("line_format: %s" % site_dict['line_format'])
-        loginf("measurement: %s" % site_dict['measurement'])
+        usn = site_dict.get("unit_system", None)
+        if usn in unit_constants:
+            site_dict["unit_system"] = unit_constants[usn]
+            log.info("desired unit system: %s", usn)
 
-        site_dict['append_units_label'] = to_bool(
-            site_dict.get('append_units_label'))
-        site_dict['augment_record'] = to_bool(site_dict.get('augment_record'))
-
-        usn = site_dict.get('unit_system', None)
-        if usn in weewx.units.unit_constants:
-            site_dict['unit_system'] = weewx.units.unit_constants[usn]
-            loginf("desired unit system: %s" % usn)
-
-        if 'inputs' in cfg_dict['StdRESTful']['Influx']:
-            site_dict['inputs'] = dict(
-                cfg_dict['StdRESTful']['Influx']['inputs'])
+        if "inputs" in cfg_dict["StdRESTful"]["Influx"]:
+            site_dict["inputs"] = dict(cfg_dict["StdRESTful"]["Influx"]["inputs"])
 
         # if we are supposed to augment the record with data from weather
         # tables, then get the manager dict to do it.  there may be no weather
         # tables, so be prepared to fail.
         try:
-            if site_dict.get('augment_record'):
+            if site_dict.get("augment_record"):
                 _manager_dict = weewx.manager.get_manager_dict_from_config(
-                    cfg_dict, 'wx_binding')
-                site_dict['manager_dict'] = _manager_dict
+                    cfg_dict, "wx_binding"
+                )
+                site_dict["manager_dict"] = _manager_dict
         except weewx.UnknownBinding:
             pass
 
-        if 'tags' in site_dict:
-            if isinstance(site_dict['tags'], list):
-                site_dict['tags'] = ','.join(site_dict['tags'])
-            loginf("tags: %s" % site_dict['tags'])
+        if "tags" in site_dict:
+            if isinstance(site_dict["tags"], list):
+                site_dict["tags"] = ",".join(site_dict["tags"])
+            log.info("tags: %s", site_dict["tags"])
 
         # we can bind to loop packets and/or archive records
-        binding = site_dict.pop('binding', 'archive')
+        binding = site_dict.pop("binding", "archive")
         if isinstance(binding, list):
-            binding = ','.join(binding)
-        loginf('binding: %s' % binding)
+            binding = ",".join(binding)
+        log.info("binding: %s", binding)
 
-        data_queue = queue.Queue()
+        data_queue = Queue()
         try:
             data_thread = InfluxThread(data_queue, **site_dict)
         except weewx.ViolatedPrecondition as e:
-            loginf("Data will not be posted: %s" % e)
+            log.info("Data will not be posted: %s", e)
             return
         data_thread.start()
 
-        if 'loop' in binding.lower():
+        if "loop" in binding.lower():
             self.loop_queue = data_queue
             self.loop_thread = data_thread
             self.bind(weewx.NEW_LOOP_PACKET, self.new_loop_packet)
-        if 'archive' in binding.lower():
+        if "archive" in binding.lower():
             self.archive_queue = data_queue
             self.archive_thread = data_thread
             self.bind(weewx.NEW_ARCHIVE_RECORD, self.new_archive_record)
-        loginf("Data will be uploaded to %s" % site_dict['server_url'])
+        log.info("Data will be uploaded to %s", site_dict["server_url"])
 
     def new_loop_packet(self, event):
-        data = {'binding': 'loop'}
+        """Called when a new loop packet is received"""
+        data = {"binding": "loop"}
         data.update(event.packet)
         self.loop_queue.put(data)
 
     def new_archive_record(self, event):
-        data = {'binding': 'archive'}
+        """Called when a new archive record is received"""
+        data = {"binding": "archive"}
         data.update(event.record)
         self.archive_queue.put(data)
 
 
-class InfluxThread(weewx.restx.RESTThread):
+class InfluxThread(RESTThread):
+    """Thread to post data to InfluxDB"""
 
-    _DEFAULT_SERVER_URL = 'http://localhost:8086'
-
-    def __init__(self, queue, database,
-                 username=None, password=None,
-                 dbadmin_username=None, dbadmin_password=None,
-                 line_format='single-line', create_database=True,
-                 measurement='record', tags=None,
-                 unit_system=None, augment_record=True,
-                 inputs=dict(), obs_to_upload='most', append_units_label=True,
-                 server_url=_DEFAULT_SERVER_URL, skip_upload=False,
-                 manager_dict=None,
-                 post_interval=None, max_backlog=MAX_SIZE, stale=None,
-                 log_success=True, log_failure=True,
-                 timeout=60, max_tries=3, retry_wait=5):
-        super(InfluxThread, self).__init__(queue,
-                                           protocol_name='Influx',
-                                           manager_dict=manager_dict,
-                                           post_interval=post_interval,
-                                           max_backlog=max_backlog,
-                                           stale=stale,
-                                           log_success=log_success,
-                                           log_failure=log_failure,
-                                           max_tries=max_tries,
-                                           timeout=timeout,
-                                           retry_wait=retry_wait)
+    def __init__(
+        self,
+        queue: Queue,
+        server_url: str,
+        database: str,
+        api_token: str,
+        line_format="single-line",
+        measurement="record",
+        tags=None,
+        unit_system=None,
+        augment_record=True,
+        inputs: dict = None,
+        obs_to_upload="most",
+        append_units_label=True,
+        skip_upload=False,
+        manager_dict=None,
+        post_interval=None,
+        max_backlog=MAX_SIZE,
+        stale=None,
+        log_success=True,
+        log_failure=True,
+        timeout=60,
+        max_tries=3,
+        retry_wait=5,
+    ):
+        super().__init__(
+            queue,
+            protocol_name="Influx",
+            manager_dict=manager_dict,
+            post_interval=post_interval,
+            max_backlog=max_backlog,
+            stale=stale,
+            log_success=log_success,
+            log_failure=log_failure,
+            max_tries=max_tries,
+            timeout=timeout,
+            retry_wait=retry_wait,
+        )
         self.database = database
-        self.username = username
-        self.password = password
+        self.api_token = api_token
         self.measurement = measurement
         self.tags = tags
         self.obs_to_upload = obs_to_upload
         self.append_units_label = append_units_label
-        self.inputs = inputs
+        self.inputs = inputs or {}
         self.server_url = server_url
         self.skip_upload = to_bool(skip_upload)
         self.unit_system = unit_system
         self.augment_record = augment_record
-        self.templates = dict()
         self.line_format = line_format
-
-        if create_database:
-            uname = None
-            pword = None
-            if dbadmin_username:
-                uname = dbadmin_username
-                pword = dbadmin_password
-            elif username:
-                uname = username
-                pword = password
-            self.create_database(uname, pword)
-
-    def create_database(self, username, password):
-        """ensure that the database exists"""
-        qstr = urlencode({'q': 'CREATE DATABASE %s' % self.database})
-        url = '%s/query?%s' % (self.server_url, qstr)
-        req = Request(url)
-        req.add_header("User-Agent", "weewx/%s" % weewx.__version__)
-        if username and password:
-            # Create a base64 byte string with the authorization info
-            base64bytes = base64.b64encode(('%s:%s' % (self.username, self.password)).encode())
-            # Add the authentication header to the request:
-            req.add_header("Authorization", b"Basic %s" % base64bytes)
-        try:
-            # The use of a GET to create a database has been deprecated.
-            # Include a dummy payload to force a POST.
-            self.post_request(req, 'None')
-        except (socket.error, socket.timeout, URLError, http_client.BadStatusLine, http_client.IncompleteRead) as e:
-            logerr("create database failed: %s" % e)
 
     def get_record(self, record, dbmanager):
         """
-        We allow the superclass to add stuff to the record only if the user
-        requests it
+        We allow the superclass to add to the record only if the user
+        requests it.
         """
         if self.augment_record and dbmanager:
-            record = super(InfluxThread, self).get_record(record, dbmanager)
+            record = super().get_record(record, dbmanager)
         if self.unit_system is not None:
-            record = weewx.units.to_std_system(record, self.unit_system)
+            record = to_std_system(record, self.unit_system)
         return record
 
     def format_url(self, _):
-        return '%s/write?db=%s' % (self.server_url, self.database)
+        """Format for Cloud InfluxDB 3 compatibility mode for v2 Write API"""
+        return f"{self.server_url}/api/v2/write?bucket={self.database}&precision=s"
 
     def get_request(self, url):
-        """Override and add username and password"""
-
-        # Get the basic Request from my superclass
-        request = super(InfluxThread, self).get_request(url)
-
-        if self.username and self.password:
-            # Create a base64 byte string with the authorization info
-            base64string = base64.b64encode(('%s:%s' % (self.username, self.password)).encode())
-            # Add the authentication header to the request:
-            request.add_header("Authorization", b"Basic %s" % base64string)
+        """Override and add access token"""
+        request = super().get_request(url)
+        request.add_header("Authorization", f"Token {self.api_token}")
         return request
 
     def check_response(self, response):
         if response.code == 204:
             return
         payload = response.read().decode()
-        if payload and payload.find('results') >= 0:
-            logdbg("code: %s payload: %s" % (response.code, payload))
+        if payload and payload.find("results") >= 0:
+            log.debug("code: %s payload: %s", response.code, payload)
             return
-        raise weewx.restx.FailedPost("Server returned '%s' (%s)" %
-                                     (payload, response.code))
+        raise FailedPost(
+            f"Server returned '{payload}' ({response.code})"
+        )
 
     def handle_exception(self, e, count):
         if isinstance(e, HTTPError):
             payload = e.read().decode()
-            logdbg("exception: %s payload: %s" % (e, payload))
+            log.debug("exception: %s payload: %s", e, payload)
             if payload and payload.find("error") >= 0:
                 if payload.find("database not found") >= 0:
-                    raise weewx.restx.AbortedPost(payload)
-        super(InfluxThread, self).handle_exception(e, count)
+                    raise AbortedPost(payload)
+        super().handle_exception(e, count)
 
     def post_request(self, request, data=None):
         """Post the request to the server"""
-        # FIXME: provide full set of ssl options instead of this hack
-        if self.server_url.startswith('https'):
+        if self.server_url.startswith("https"):
             import ssl
+
             encoded = None
             if data:
-                encoded = data.encode('utf-8')
-            return urlopen(request, data=encoded, timeout=self.timeout,
-                           context=ssl._create_unverified_context())
-        return super(InfluxThread, self).post_request(request, data)
+                encoded = data.encode("utf-8")
+            return urlopen(
+                request,
+                data=encoded,
+                timeout=self.timeout,
+                context=ssl._create_unverified_context(),
+            )
+        return super().post_request(request, data)
 
-    def get_post_body(self, record):
+    def get_templates(self, record: dict):
+        """Parse formatting options and create a template for each observation"""
+        templates = {}
+        # Check every the list of variables that should be uploaded
+        if self.obs_to_upload in ("all", "most"):
+            for key in record.keys():
+                if self.obs_to_upload == "most" and key in OBS_TO_SKIP:
+                    continue
+                if key not in templates:
+                    templates[key] = _get_template(
+                        key,
+                        self.inputs.get(key, {}),
+                        self.append_units_label,
+                        record["usUnits"],
+                    )
+        else:
+            for key in self.inputs.keys():
+                templates[key] = _get_template(
+                    key, self.inputs[key], self.append_units_label, record["usUnits"]
+                )
+        return templates
+
+    @staticmethod
+    def _float_to_string(template: dict[str, str], value: float, key: str, unit_system: str):
+        fmt = template.get("format", "%s")
+        to_units = template.get("units")
+        if to_units is not None:
+            from_unit, from_group = getStandardUnitType(
+                unit_system, key
+            )
+            from_t = (value, from_unit, from_group)
+            return fmt % convert(from_t, to_units)[0]
+        return fmt % value
+
+    def format_items(self, templates: dict[str, dict], tags: str, record: dict) -> list[str]:
+        """
+        loop through the templates, populating them with data from the
+        record.
+        """
+        data = []
+        for key, template in templates.items():
+            try:
+                value = record[key]
+                s = InfluxThread._float_to_string(template, value, key, record["usUnits"])
+                name = template.get("name", key)
+                if self.line_format == "multi-line-dotted":
+                    # use multiple lines with a dotted-name identifier
+                    data.append(
+                        f"{self.measurement}.{name}{tags} value={s} {record['dateTime']}"
+                    )
+                elif self.line_format == "multi-line":
+                    # use multiple lines
+                    data.append(
+                        f"{name}{tags} value={s} {record['dateTime']}"
+                    )
+                else:
+                    # default: use a single line
+                    data.append(f"{name}={s}")
+            except (TypeError, ValueError) as e:
+                log.debug("skipped value '%s': %s", record.get(key), e)
+        return data
+
+    def get_post_body(self, record: dict):
         """Override my superclass and get the body of the POST"""
 
         # create the list of tags
-        tags = ''
-        binding = record.pop('binding', None)
+        tags = ""
+        binding = record.pop("binding", None)
         if binding is not None:
-            tags = ',binding=%s' % binding
+            tags = f",binding={binding}"
         if self.tags:
-            tags = '%s,%s' % (tags, self.tags)
-
-        # if uploading everything, we must check every time the list of
-        # variables that should be uploaded since variables may come and
-        # go in a record.  use the inputs to override any generic template
-        # generation.
-        if self.obs_to_upload == 'all' or self.obs_to_upload == 'most':
-            for f in record:
-                if self.obs_to_upload == 'most' and f in OBS_TO_SKIP:
-                    continue
-                if f not in self.templates:
-                    self.templates[f] = _get_template(f,
-                                                      self.inputs.get(f, {}),
-                                                      self.append_units_label,
-                                                      record['usUnits'])
-
-        # otherwise, create the list of upload variables once, based on the
-        # user-specified list of inputs.
-        elif not self.templates:
-            for f in self.inputs:
-                self.templates[f] = _get_template(f, self.inputs[f],
-                                                  self.append_units_label,
-                                                  record['usUnits'])
+            tags = f"{tags},{self.tags}"
+        templates = self.get_templates(record)
 
         # loop through the templates, populating them with data from the
         # record.
-        data = []
-        for k, v in self.templates.items():
-            try:
-                v = float(v)
-                name = self.templates[k].get('name', k)
-                fmt = self.templates[k].get('format', '%s')
-                to_units = self.templates[k].get('units')
-                if to_units is not None:
-                    (from_unit, from_group) = weewx.units.getStandardUnitType(
-                        record['usUnits'], k)
-                    from_t = (v, from_unit, from_group)
-                    v = weewx.units.convert(from_t, to_units)[0]
-                s = fmt % v
-                if self.line_format == 'multi-line-dotted':
-                    # use multiple lines with a dotted-name identifier
-                    n = "%s.%s" % (self.measurement, name)
-                    data.append('%s%s value=%s %d' %
-                                (n, tags, s, record['dateTime']*1000000000))
-                elif self.line_format == 'multi-line':
-                    # use multiple lines
-                    data.append('%s%s value=%s %d' %
-                                (name, tags, s, record['dateTime']*1000000000))
-                else:
-                    # use a single line
-                    data.append('%s=%s' % (name, s))
-            except (TypeError, ValueError) as e:
-                # FIXME: influx1 does not support NULL.  for influx2, ensure
-                # that any None values are retained as NULL.
-                logdbg("skipped value '%s': %s" % (record.get(k), e))
-        if self.line_format == 'multi-line' or self.line_format == 'multi-line-dotted':
-            str_data = '\n'.join(data)
+        data = self.format_items(templates, tags, record)
+        if self.line_format in ("multi-line", "multi-line-dotted"):
+            str_data = "\n".join(data)
         else:
-            str_data = '%s%s %s %d' % (self.measurement, tags, ','.join(data), record['dateTime']*1000000000)
-        return str_data, 'application/x-www-form-urlencoded'
+            str_data = f"{self.measurement}{tags} {','.join(data)} {record['dateTime']}"
+        return str_data, "text/plain; charset=utf-8"
 
-# Use this hook to test the uploader:
-#   PYTHONPATH=bin python bin/user/influx.py
-
-if __name__ == "__main__":
-    from argparse import ArgumentParser
-    import time
-
-    weewx.debug = 2
-
-    usage = """Usage: python -m influx --help
-       python -m influx --version
-       python -m influx [--server-url=SERVER-URL] 
-                        [--user=USER] [--password=PASSWORD]
-                        [--admin-user=ADMIN-USER] [--admin-password=ADMIN-PASSWORD]
-                        [--database=DBNAME] [--measurement=MEASUREMENT]
-                        [--tags=TAGS]"""
-
-    parser = ArgumentParser(usage=usage)
-    parser.add_argument('--version', action='store_true',
-                      help='Display weewx-influx version')
-    parser.add_argument('--server-url', default='http://localhost:8086',
-                      help="URL for the InfluxDB server. Default is 'http://localhost:8086'",
-                      metavar="SERVER-URL")
-    parser.add_argument('--user', default='weewx',
-                      help="User name to be used for data posts. Default is 'weewx'",
-                      metavar="USER")
-    parser.add_argument('--password', default='weewx',
-                      help="Password for USER. Default is 'weewx'",
-                      metavar="PASSWORD")
-    parser.add_argument('--admin-user',
-                      help="Admin user to be used when creating the database.",
-                      metavar="ADMIN-USER")
-    parser.add_argument('--admin-password',
-                      help="Password for ADMIN-USER.",
-                      metavar="ADMIN-PASSWORD")
-    parser.add_argument('--database', default='tester',
-                      help="InfluxDB database name. Default is 'tester'",
-                      metavar="DBNAME")
-    parser.add_argument('--measurement', default='record',
-                      help="InfluxDB measurement name. Default is 'record'",
-                      metavar="MEASUREMENT")
-    parser.add_argument('--tags', default='station=A,field=C',
-                      help="Influxdb tags to be used. Default is 'station=A,field=C'",
-                      metavar="TAGS")
-    (options, args) = parser.parse_args()
-
-    if options.version:
-        print("weewx-influxdb version %s" % VERSION)
-        exit(0)
-
-    print("Using server-url of '%s'" % options.server_url)
-
-    queue = queue.Queue()
-    t = InfluxThread(queue,
-                     manager_dict=None,
-                     database=options.database,
-                     username=options.user,
-                     password=options.password,
-                     measurement=options.measurement,
-                     tags=options.tags,
-                     server_url=options.server_url)
-    queue.put({'dateTime': int(time.time() + 0.5),
-               'usUnits': weewx.US,
-               'outTemp': 32.5,
-               'inTemp': 75.8,
-               'outHumidity': 24})
-    queue.put(None)
-    t.run()
