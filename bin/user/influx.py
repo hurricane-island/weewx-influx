@@ -3,12 +3,16 @@ Influx is a platform for collecting, storing, and managing time-series data.
 """
 from queue import Queue
 from logging import getLogger
+from typing import Union
 from distutils.version import StrictVersion
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+from configobj import ConfigObj
+from overrides import overrides
 import weewx
 from weewx.restx import RESTThread, FailedPost, AbortedPost, StdRESTbase, get_site_dict
 from weewx.units import convert, getStandardUnitType, unit_constants, to_std_system
+from weewx.manager import get_manager_dict_from_config
 from weeutil.weeutil import to_bool
 
 
@@ -39,26 +43,92 @@ UNIT_REDUCTIONS = {
     "unix_epoch": None,
 }
 # observations that should be skipped when obs_to_upload is 'most'
-OBS_TO_SKIP = ["dateTime", "interval", "usUnits"]
+OBS_TO_SKIP = ["dateTime", "usUnits"]
 MAX_SIZE = 1000000
 
-def _get_template(obs_key: str, overrides: dict, append_units_label: bool, unit_system):
-    """get the template for an observation based on the observation key"""
-    template = {}
-    if append_units_label:
-        unit_type = overrides.get("units")
-        if unit_type is None:
-            unit_type, _ = getStandardUnitType(unit_system, obs_key)
-        label = UNIT_REDUCTIONS.get(unit_type, unit_type)
-        if label is not None:
-            template["name"] = f"{obs_key}_{label}"
-    for x in ["name", "format", "units"]:
-        if x in overrides:
-            template[x] = overrides[x]
-    return template
+class LineProtocol:
+    """
+    Single line protocol for InfluxDB. Contains multiple fields separated by commas.
+    """
+
+    def __init__(self, measurement: str, tags: str, fields: list[str], timestamp: str):
+        self.measurement = measurement
+        self.tags = tags
+        self.values = ",".join(fields)
+        self.timestamp = timestamp
+
+    def __str__(self):
+        return f"{self.measurement}{self.tags} {self.values} {self.timestamp}"
+    
+    def from_record(self, measurement: str, record: dict[str], tags: str = ""):
+        """Create a LineProtocol object from a record"""
+        self.measurement = measurement
+        self.tags = record.pop("tags", None)
+        self.timestamp = record.pop("dateTime")
+        self.tags = ""
+        binding = record.pop("binding", None)
+        if binding is not None:
+            self.tags = f",binding={binding}"
+        if self.tags:
+            self.tags += f",{tags}"
+        units = record.pop("usUnits")
+        date_time = record.pop("dateTime")
+        filtered = filter(self._filter_fields, record.keys())
+        data = []
+        for name in filtered:
+            result = Observation(
+                name,
+                append_units=self.append_units,
+                units=units,
+            ).format_record(record)
+            if result is not None:
+                data.append(result)
+        values = ",".join(data)
+
+class Observation:
+    """A template for an observation"""
+
+    def __init__(
+        self,
+        name: str,
+        units: str,
+        append_units: bool,
+        fmt: str = "%s",
+    ):
+        self.name = name
+        self.fmt = fmt
+        self.units = units
+        if append_units:
+            self.units, _ = getStandardUnitType(units, name)
+            label = UNIT_REDUCTIONS.get(self.units, self.units)
+            if label is not None:
+                self.name = f"{name}_{label}"
+
+    def convert_and_format(self, value: float, key: str, unit_system: str) -> str:
+        """Unit conversion and formatting"""
+        if self.units is not None:
+            from_unit, from_group = getStandardUnitType(unit_system, key)
+            from_t = (value, from_unit, from_group)
+            return self.fmt % convert(from_t, self.units)[0]
+        return self.fmt % value
+
+    def format_record(self, record: dict) -> str:
+        """
+        loop through the templates, populating them with data from the
+        record.
+        """
+        try:
+            value = record[self.name]
+            formatted = self.convert_and_format(value, self.name, record["usUnits"])
+            return f"{self.name}={formatted}"
+        except (TypeError, ValueError) as e:
+            log.debug("skipped value '%s': %s", record.get(self.name), e)
+            return None
+
 
 class Influx(StdRESTbase):
     """REST implementation for InfluxDB"""
+
     def __init__(self, engine, cfg_dict):
         """This service recognizes standard restful options plus the following:
 
@@ -66,29 +136,17 @@ class Influx(StdRESTbase):
 
         database: name of the database at the server
 
-        Optional parameters:
-
-        host: server hostname
-        Default is localhost
-
-        port: server port
-        Default is 8086
-
         server_url: full restful endpoint of the server
-        Default is None
 
         measurement: name of the measurement
-        Default is 'record'
+
+        Optional parameters:
 
         tags: comma-delimited list of name=value pairs to identify the
         measurement.  tags cannot contain spaces.
         Default is None
 
-        line_format: which line protocol format to use.  Possible values are
-        single-line, multi-line, or multi-line-dotted.
-        Default is single-line
-
-        append_units_label: should units label be appended to name
+        append_units: should units label be appended to name
         Default is True
 
         obs_to_upload: Which observations to upload.  Possible values are
@@ -105,59 +163,38 @@ class Influx(StdRESTbase):
         Default is archive
         """
         super().__init__(engine, cfg_dict)
-        site_dict = get_site_dict(cfg_dict, "Influx", "database")
+        site_dict: ConfigObj = get_site_dict(cfg_dict, "Influx", "database")
         if site_dict is None:
             return
-        site_dict.setdefault("api_token", "")
-        site_dict.setdefault("tags", None)
-        site_dict.setdefault("line_format", "single-line")
-        site_dict.setdefault("obs_to_upload", "most")
-        site_dict.setdefault("append_units_label", True)
-        site_dict.setdefault("augment_record", True)
-        site_dict.setdefault("measurement", "record")
-
-        log.info("database: %s", site_dict["database"])
-        log.info("destination: %s", site_dict["server_url"])
-        log.info("line_format: %s", site_dict["line_format"])
-        log.info("measurement: %s", site_dict["measurement"])
-
-        site_dict["append_units_label"] = to_bool(site_dict.get("append_units_label"))
-        site_dict["augment_record"] = to_bool(site_dict.get("augment_record"))
-
-        usn = site_dict.get("unit_system", None)
-        if usn in unit_constants:
-            site_dict["unit_system"] = unit_constants[usn]
-            log.info("desired unit system: %s", usn)
-
+            # we can bind to loop packets and/or archive records
+        binding = site_dict.pop("binding", "archive")
+        if isinstance(binding, list):
+            binding = ",".join(binding)
+        append_units = to_bool(site_dict.pop("append_units"))
+        select = None
         if "inputs" in cfg_dict["StdRESTful"]["Influx"]:
-            site_dict["inputs"] = dict(cfg_dict["StdRESTful"]["Influx"]["inputs"])
+            select = dict(cfg_dict["StdRESTful"]["Influx"]["inputs"])
 
         # if we are supposed to augment the record with data from weather
         # tables, then get the manager dict to do it.  there may be no weather
         # tables, so be prepared to fail.
+        augment_record = to_bool(site_dict.pop("augment_record"))
+        manager_dict = None
         try:
-            if site_dict.get("augment_record"):
-                _manager_dict = weewx.manager.get_manager_dict_from_config(
-                    cfg_dict, "wx_binding"
-                )
-                site_dict["manager_dict"] = _manager_dict
+            if augment_record:
+                manager_dict = get_manager_dict_from_config(cfg_dict, "wx_binding")
         except weewx.UnknownBinding:
             pass
-
-        if "tags" in site_dict:
-            if isinstance(site_dict["tags"], list):
-                site_dict["tags"] = ",".join(site_dict["tags"])
-            log.info("tags: %s", site_dict["tags"])
-
-        # we can bind to loop packets and/or archive records
-        binding = site_dict.pop("binding", "archive")
-        if isinstance(binding, list):
-            binding = ",".join(binding)
-        log.info("binding: %s", binding)
-
         data_queue = Queue()
         try:
-            data_thread = InfluxThread(data_queue, **site_dict)
+            data_thread = InfluxThread(
+                data_queue,
+                manager_dict=manager_dict,
+                augment_record=augment_record,
+                append_units=append_units,
+                select=select,
+                **site_dict,
+            )
         except weewx.ViolatedPrecondition as e:
             log.info("Data will not be posted: %s", e)
             return
@@ -171,7 +208,7 @@ class Influx(StdRESTbase):
             self.archive_queue = data_queue
             self.archive_thread = data_thread
             self.bind(weewx.NEW_ARCHIVE_RECORD, self.new_archive_record)
-        log.info("Data will be uploaded to %s", site_dict["server_url"])
+        log.info("Data will be uploaded to %s", data_thread.server_url)
 
     def new_loop_packet(self, event):
         """Called when a new loop packet is received"""
@@ -193,25 +230,24 @@ class InfluxThread(RESTThread):
         self,
         queue: Queue,
         server_url: str,
-        database: str,
+        bucket: str,
         api_token: str,
-        line_format="single-line",
-        measurement="record",
-        tags=None,
-        unit_system=None,
-        augment_record=True,
-        inputs: dict = None,
-        obs_to_upload="most",
-        append_units_label=True,
-        skip_upload=False,
+        measurement: str,
+        tags: list[str] = None,
+        unit_system: str = None,
+        augment_record: bool = True,
+        select: dict = None,
+        omit: list[str] = [],
+        append_units: Union[str, bool] = True,
+        # Superclass options
         manager_dict=None,
-        post_interval=None,
-        max_backlog=MAX_SIZE,
+        post_interval: int = None,
+        max_backlog: int = MAX_SIZE,
         stale=None,
         log_success=True,
         log_failure=True,
-        timeout=60,
         max_tries=3,
+        timeout=10,
         retry_wait=5,
     ):
         super().__init__(
@@ -227,19 +263,22 @@ class InfluxThread(RESTThread):
             timeout=timeout,
             retry_wait=retry_wait,
         )
-        self.database = database
+        self.augment_record = to_bool(augment_record)
+        if unit_system in unit_constants:
+            self.unit_system = unit_constants[unit_system]
+        if isinstance(tags, list):
+            self.tags = ",".join(tags)
+        else:
+            self.tags = tags
+        self.bucket = bucket
         self.api_token = api_token
         self.measurement = measurement
-        self.tags = tags
-        self.obs_to_upload = obs_to_upload
-        self.append_units_label = append_units_label
-        self.inputs = inputs or {}
+        self.omit = omit
+        self.append_units = to_bool(append_units)
+        self.select = select or {}
         self.server_url = server_url
-        self.skip_upload = to_bool(skip_upload)
-        self.unit_system = unit_system
-        self.augment_record = augment_record
-        self.line_format = line_format
 
+    @overrides
     def get_record(self, record, dbmanager):
         """
         We allow the superclass to add to the record only if the user
@@ -251,38 +290,42 @@ class InfluxThread(RESTThread):
             record = to_std_system(record, self.unit_system)
         return record
 
+    @overrides
     def format_url(self, _):
         """Format for Cloud InfluxDB 3 compatibility mode for v2 Write API"""
-        return f"{self.server_url}/api/v2/write?bucket={self.database}&precision=s"
+        return f"{self.server_url}/api/v2/write?bucket={self.bucket}&precision=s"
 
+    @overrides
     def get_request(self, url):
         """Override and add access token"""
         request = super().get_request(url)
         request.add_header("Authorization", f"Token {self.api_token}")
         return request
 
+    @overrides
     def check_response(self, response):
+        """Determine status of response and handle failures"""
         if response.code == 204:
             return
         payload = response.read().decode()
         if payload and payload.find("results") >= 0:
             log.debug("code: %s payload: %s", response.code, payload)
             return
-        raise FailedPost(
-            f"Server returned '{payload}' ({response.code})"
-        )
+        raise FailedPost(f"Server returned '{payload}' ({response.code})")
 
+    @overrides
     def handle_exception(self, e, count):
         if isinstance(e, HTTPError):
             payload = e.read().decode()
             log.debug("exception: %s payload: %s", e, payload)
             if payload and payload.find("error") >= 0:
-                if payload.find("database not found") >= 0:
+                if payload.find("bucket not found") >= 0:
                     raise AbortedPost(payload)
         super().handle_exception(e, count)
 
-    def post_request(self, request, data=None):
-        """Post the request to the server"""
+    @overrides
+    def post_request(self, request: Request, data: str = None):
+        """Supply unverified SSL context for HTTPS requests"""
         if self.server_url.startswith("https"):
             import ssl
 
@@ -297,71 +340,16 @@ class InfluxThread(RESTThread):
             )
         return super().post_request(request, data)
 
-    def get_templates(self, record: dict):
-        """Parse formatting options and create a template for each observation"""
-        templates = {}
-        # Check every the list of variables that should be uploaded
-        if self.obs_to_upload in ("all", "most"):
-            for key in record.keys():
-                if self.obs_to_upload == "most" and key in OBS_TO_SKIP:
-                    continue
-                if key not in templates:
-                    templates[key] = _get_template(
-                        key,
-                        self.inputs.get(key, {}),
-                        self.append_units_label,
-                        record["usUnits"],
-                    )
-        else:
-            for key in self.inputs.keys():
-                templates[key] = _get_template(
-                    key, self.inputs[key], self.append_units_label, record["usUnits"]
-                )
-        return templates
+    def _filter_fields(self, key):
+        if self.omit and key in self.omit:
+            return False
+        if self.select and key not in self.select:
+            return False
+        return True
 
-    @staticmethod
-    def _float_to_string(template: dict[str, str], value: float, key: str, unit_system: str):
-        fmt = template.get("format", "%s")
-        to_units = template.get("units")
-        if to_units is not None:
-            from_unit, from_group = getStandardUnitType(
-                unit_system, key
-            )
-            from_t = (value, from_unit, from_group)
-            return fmt % convert(from_t, to_units)[0]
-        return fmt % value
-
-    def format_items(self, templates: dict[str, dict], tags: str, record: dict) -> list[str]:
-        """
-        loop through the templates, populating them with data from the
-        record.
-        """
-        data = []
-        for key, template in templates.items():
-            try:
-                value = record[key]
-                s = InfluxThread._float_to_string(template, value, key, record["usUnits"])
-                name = template.get("name", key)
-                if self.line_format == "multi-line-dotted":
-                    # use multiple lines with a dotted-name identifier
-                    data.append(
-                        f"{self.measurement}.{name}{tags} value={s} {record['dateTime']}"
-                    )
-                elif self.line_format == "multi-line":
-                    # use multiple lines
-                    data.append(
-                        f"{name}{tags} value={s} {record['dateTime']}"
-                    )
-                else:
-                    # default: use a single line
-                    data.append(f"{name}={s}")
-            except (TypeError, ValueError) as e:
-                log.debug("skipped value '%s': %s", record.get(key), e)
-        return data
-
-    def get_post_body(self, record: dict):
+    @overrides
+    def get_post_body(self, record: dict[str]):
         """Override my superclass and get the body of the POST"""
-
         # create the list of tags
         tags = ""
         binding = record.pop("binding", None)
@@ -369,14 +357,18 @@ class InfluxThread(RESTThread):
             tags = f",binding={binding}"
         if self.tags:
             tags = f"{tags},{self.tags}"
-        templates = self.get_templates(record)
-
-        # loop through the templates, populating them with data from the
-        # record.
-        data = self.format_items(templates, tags, record)
-        if self.line_format in ("multi-line", "multi-line-dotted"):
-            str_data = "\n".join(data)
-        else:
-            str_data = f"{self.measurement}{tags} {','.join(data)} {record['dateTime']}"
+        units = record.pop("usUnits")
+        date_time = record.pop("dateTime")
+        filtered = filter(self._filter_fields, record.keys())
+        data = []
+        for name in filtered:
+            result = Observation(
+                name,
+                append_units=self.append_units,
+                units=units,
+            ).format_record(record)
+            if result is not None:
+                data.append(result)
+        values = ",".join(data)
+        str_data = f"{self.measurement}{tags} {values} {date_time}"
         return str_data, "text/plain; charset=utf-8"
-

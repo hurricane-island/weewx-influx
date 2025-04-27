@@ -1,4 +1,4 @@
-
+"""Test script for InfluxDB integration with Weewx"""
 from time import time
 from os import getenv
 from bin.user.influx import Queue, weewx, InfluxThread
