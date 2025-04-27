@@ -25,7 +25,7 @@ since the container should be discarded and rebuilt if something changes.
 ## Development
 
 The repository provides a Pipfile and lockfile with python dev dependencies to enable project based
-environments for linting and code completion.
+environments for linting and code completion. To activate the shell, run `pipenv shell`.
 
 There are not unit tests, but it is possible to run the `/bin/user/influx.py` as a 
 program to do an integration test against a known influx instance. This will pick up the required
@@ -37,6 +37,8 @@ parameters from the environment instead of the configuration file:
 - `INFLUX_BUCKET`
 
 In this case you may want to use `direnv` to manage local environment variables in an `.envrc` file.
+
+
 
 ## Configuration
 
@@ -56,5 +58,5 @@ For example:
         api_token = $API_TOKEN
         measurement = weather_stations
         binding = archive
-        tags = Rockland, Vantage
+        tags = station=Rockland, device=Vantage
         select = outTemp, inTemp, outHumidity

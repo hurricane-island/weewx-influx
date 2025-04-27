@@ -23,6 +23,7 @@ REQUIRED_CONFIG = ["bucket", "server_url", "api_token", "measurement"]
 ENCODING = "utf-8"
 PRECISION = "s"
 
+
 def split_optional_csv(value: Optional[str]) -> list[str]:
     """
     Split a CSV string into a list of strings.
@@ -30,6 +31,7 @@ def split_optional_csv(value: Optional[str]) -> list[str]:
     if value is None:
         return []
     return [item.strip() for item in value.split(",")]
+
 
 # pylint: disable=too-few-public-methods
 class LineProtocol:
@@ -46,14 +48,14 @@ class LineProtocol:
         select: list[str],
         tags: list[str],
         dateTime: Union[int, str],
-        binding,
+        binding: Optional[str] = None,
         **kwargs,
     ):
         self.measurement = measurement
         self.timestamp = dateTime
-        self.tags = f",binding={binding}"
+        self.tags = f",binding={binding}" if binding is not None else ""
         if tags:
-            self.tags += f",{tags}"
+            self.tags += "," + ",".join(tags)
 
         def filter_fcn(item: tuple[str, float]):
             key, _ = item
@@ -209,7 +211,7 @@ class InfluxThread(RESTThread):
         )
 
     @overrides
-    def get_record(self, record, _):
+    def get_record(self, record, dbmanager) -> dict[str]:
         """Use plain record without aggregation"""
         return record
 
@@ -265,13 +267,15 @@ class InfluxThread(RESTThread):
     @overrides
     def get_post_body(self, record: dict[str]) -> tuple[str, str]:
         """Format body for the POST request"""
-        line = LineProtocol(measurement=self.measurement, tags=self.tags, **record)
+        line = LineProtocol(
+            measurement=self.measurement,
+            tags=self.tags,
+            select=self.select,
+            **record,
+        )
         return str(line), self.content_type
 
 if __name__ == "__main__":
-    # This module is not intended to be run as a standalone script.
-    # It is designed to be used as part of the WeeWX weather station software.
-    # Run module as a script for testing purposes only.
     from time import time
     from os import getenv
 
@@ -283,21 +287,9 @@ if __name__ == "__main__":
         measurement=getenv("INFLUX_MEASUREMENT"),
         server_url=getenv("INFLUX_SERVER_URL"),
         binding="archive",
-        tags="test",
+        tags="station=test",
         select="outTemp,inTemp,outHumidity",
-        # RESTThread parameters passed through
-        essentials={},
-        post_interval=None,
-        stale=None,
-        log_success=True,
-        log_failure=True,
-        timeout=10,
-        max_tries=3,
-        retry_wait=5,
-        retry_login=3600,
-        retry_ssl=3600,
-        skip_upload=False,
-        delay_post=None
+        max_tries=1,
     )
 
     record = {
