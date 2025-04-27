@@ -11,13 +11,32 @@ This plugin is intended to be downloaded with git, and embedded in a Docker cont
 for distribution to a device fleet with Balena Cloud. This involves templating the 
 configuration file and updating it from the device-level environment variables.
 
+In addition to the python requirements of WeeWx, you will also need the `overrides` package.
+
 ```docker
+RUN pip install --no-cache dir overrides
 RUN git clone https://github.com/hurricane-island/weewx-influx.git /root/weewx-influx
-COPY ./weewx.template.conf ./template.py /root/weewx-data/
+COPY <CONFIG TEMPLATE> <TEMPLATING SCRIPT> /root/weewx-data/
 ```
 
 This mimics the WeeWx installation process, so there is no longer an `install.py` file, 
 since the container should be discarded and rebuilt if something changes.
+
+## Development
+
+The repository provides a Pipfile and lockfile with python dev dependencies to enable project based
+environments for linting and code completion.
+
+There are not unit tests, but it is possible to run the `/bin/user/influx.py` as a 
+program to do an integration test against a known influx instance. This will pick up the required
+parameters from the environment instead of the configuration file:
+
+- `INFLUX_SERVER_URL`
+- `INFLUX_MEASUREMENT`
+- `INFLUX_API_TOKEN`
+- `INFLUX_BUCKET`
+
+In this case you may want to use `direnv` to manage local environment variables in an `.envrc` file.
 
 ## Configuration
 

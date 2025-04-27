@@ -1,5 +1,9 @@
 """
 Influx is a platform for collecting, storing, and managing time-series data.
+
+This extension for WeeWX sends weather data to InfluxDB 3 v2 using the Write API.
+It is purposely limited in functionality to be simple and easy to use for specific
+hardware and software configurations that we need, without many additional features.
 """
 
 from queue import Queue
@@ -43,7 +47,7 @@ class LineProtocol:
         tags: list[str],
         dateTime: Union[int, str],
         binding,
-        **record,
+        **kwargs,
     ):
         self.measurement = measurement
         self.timestamp = dateTime
@@ -55,7 +59,7 @@ class LineProtocol:
             key, _ = item
             return len(select) == 0 or key in select
 
-        filtered = filter(filter_fcn, record.items())
+        filtered = filter(filter_fcn, kwargs.items())
         data = map(Observation.str_from_item, filtered)
         self.values = ",".join(data)
 
@@ -155,7 +159,7 @@ class Influx(StdRESTbase):
 class InfluxThread(RESTThread):
     """Thread to post data to InfluxDB"""
 
-    # pylint: disable=too-many-arguments, too-many-positional-arguments
+    # pylint: disable=too-many-arguments, too-many-positional-arguments, redefined-outer-name
     @overrides
     def __init__(
         self,
@@ -263,3 +267,46 @@ class InfluxThread(RESTThread):
         """Format body for the POST request"""
         line = LineProtocol(measurement=self.measurement, tags=self.tags, **record)
         return str(line), self.content_type
+
+if __name__ == "__main__":
+    # This module is not intended to be run as a standalone script.
+    # It is designed to be used as part of the WeeWX weather station software.
+    # Run module as a script for testing purposes only.
+    from time import time
+    from os import getenv
+
+    test_queue = Queue()
+    test_thread = InfluxThread(
+        queue=test_queue,
+        bucket=getenv("INFLUX_BUCKET"),
+        api_token=getenv("INFLUX_API_TOKEN"),
+        measurement=getenv("INFLUX_MEASUREMENT"),
+        server_url=getenv("INFLUX_SERVER_URL"),
+        binding="archive",
+        tags="test",
+        select="outTemp,inTemp,outHumidity",
+        # RESTThread parameters passed through
+        essentials={},
+        post_interval=None,
+        stale=None,
+        log_success=True,
+        log_failure=True,
+        timeout=10,
+        max_tries=3,
+        retry_wait=5,
+        retry_login=3600,
+        retry_ssl=3600,
+        skip_upload=False,
+        delay_post=None
+    )
+
+    record = {
+        "dateTime": int(time()),
+        "outTemp": 33.5,
+        "inTemp": 75.8,
+        "outHumidity": 24,
+    }
+
+    test_queue.put(record)
+    test_queue.put(None)
+    test_thread.run()
