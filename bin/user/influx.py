@@ -243,12 +243,12 @@ class InfluxThread(RESTThread):
         self, request: Request, data: Optional[str] = None
     ) -> HTTPResponse:
         """Make request using client API"""
-        client = InfluxDBClient3(
+        with InfluxDBClient3(
             host=self.server_url,
             database=self.bucket,
             token=self.api_token
-        )
-        client.write(record=data, write_precision=PRECISION)
+        ) as client:
+            client.write(record=data, write_precision=PRECISION)
         return ResponseMock()
 
     @overrides
