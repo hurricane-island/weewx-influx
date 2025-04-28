@@ -196,7 +196,7 @@ class InfluxThread(RESTThread):
         self.select = split_optional_csv(select)
         self.tags = split_optional_csv(tags)
         self.server_url = server_url.replace("http://", "https://")
-        self.binding = binding.lower()
+        self.binding = binding
 
     @property
     def loop(self) -> bool:
