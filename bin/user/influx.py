@@ -242,7 +242,7 @@ class InfluxThread(RESTThread):
     def post_request(
         self, request: Request, data: Optional[str] = None
     ) -> HTTPResponse:
-        """Make request with unverified SSL context"""
+        """Make request using client API"""
         client = InfluxDBClient3(
             host=self.server_url,
             database=self.bucket,
