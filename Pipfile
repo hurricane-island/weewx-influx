@@ -4,11 +4,13 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
+influxdb3-python = "*"
 
 [dev-packages]
 weewx = "5.1.0"
 overrides = "*"
 configobj = "*"
+influxdb3-python = "*"
 
 [requires]
 python_version = "3.9"

@@ -9,19 +9,28 @@ hardware and software configurations that we need, without many additional featu
 from queue import Queue
 from logging import getLogger
 from typing import Union, Any, Optional
-from ssl import _create_unverified_context
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.request import Request
 from http.client import HTTPResponse
 from configobj import ConfigObj
 from overrides import overrides
 from weewx import __version__, NEW_ARCHIVE_RECORD, NEW_LOOP_PACKET
-from weewx.restx import RESTThread, FailedPost, AbortedPost, StdRESTbase, get_site_dict
+from weewx.restx import RESTThread, FailedPost, StdRESTbase, get_site_dict
+from influxdb_client_3 import InfluxDBClient3
 
 log = getLogger(__name__)
 REQUIRED_CONFIG = ["bucket", "server_url", "api_token", "measurement"]
 ENCODING = "utf-8"
 PRECISION = "s"
+
+class ResponseMock:
+    """
+    Using the Influx library, we don't get a response object.
+    """
+    def __init__(self):
+        self.code = 204
+    def get_code(self):
+        """Stub method to mimic HTTPResponse"""
+        return self.code
 
 
 def split_optional_csv(value: Optional[str]) -> list[str]:
@@ -204,21 +213,10 @@ class InfluxThread(RESTThread):
         """Content type for the POST request"""
         return f"text/plain; charset={ENCODING}"
 
-    def __str__(self):
-        """String representation of the InfluxDB 3 v2 Write API"""
-        return (
-            f"{self.server_url}/api/v2/write?bucket={self.bucket}&precision={PRECISION}"
-        )
-
     @overrides
     def get_record(self, record, dbmanager) -> dict[str]:
         """Use plain record without aggregation"""
         return record
-
-    @overrides
-    def format_url(self, _) -> str:
-        """URL for POST requests"""
-        return str(self)
 
     @overrides
     def get_request(self, url: str) -> Request:
@@ -230,24 +228,14 @@ class InfluxThread(RESTThread):
     @overrides
     def check_response(self, response: HTTPResponse) -> None:
         """Determine status of response and handle failures"""
-        status = response.getcode()
+        status = response.code
         if status == 204:
             return
-        payload = response.read().decode()
-        if payload and payload.find("results") >= 0:
-            log.debug("code: %s payload: %s", status, payload)
-            return
-        raise FailedPost(f"Server returned '{payload}' ({status})")
+        raise FailedPost(f"Server returned ({status})")
 
     @overrides
     def handle_exception(self, e, count: int) -> None:
         """Abort if bucket not found"""
-        if isinstance(e, HTTPError):
-            payload = e.read().decode()
-            log.debug("exception: %s payload: %s", e, payload)
-            if payload and payload.find("error") >= 0:
-                if payload.find("bucket not found") >= 0:
-                    raise AbortedPost(payload)
         super().handle_exception(e, count)
 
     @overrides
@@ -255,14 +243,13 @@ class InfluxThread(RESTThread):
         self, request: Request, data: Optional[str] = None
     ) -> HTTPResponse:
         """Make request with unverified SSL context"""
-        if data is None:
-            raise ValueError("Post request missing body")
-        return urlopen(
-            request,
-            data=data.encode(ENCODING),
-            timeout=self.timeout,
-            context=_create_unverified_context(),
+        client = InfluxDBClient3(
+            host=self.server_url,
+            database=self.bucket,
+            token=self.api_token
         )
+        client.write(record=data, write_precision=PRECISION)
+        return ResponseMock()
 
     @overrides
     def get_post_body(self, record: dict[str]) -> tuple[str, str]:
