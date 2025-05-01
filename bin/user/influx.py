@@ -91,6 +91,8 @@ class Observation:
 
     def __str__(self):
         """Key value pair for Line Protocol"""
+        if self.value is None:
+            return f"{self.key}=null"
         return f"{self.key}={self.value}"
 
     @classmethod
