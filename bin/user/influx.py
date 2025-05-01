@@ -27,6 +27,7 @@ class ResponseMock:
     Using the Influx library, we don't get a response object.
     """
     def __init__(self):
+        print("Influx: Mock 204 response object created")
         self.code = 204
     def get_code(self):
         """Stub method to mimic HTTPResponse"""
@@ -248,12 +249,13 @@ class InfluxThread(RESTThread):
         self, request: Request, data: Optional[str] = None
     ) -> HTTPResponse:
         """Make request using client API"""
+        print(f"Influx: Request connection data to {self.format_url(None)}")
         with InfluxDBClient3(
             host=self.server_url,
             database=self.bucket,
             token=self.api_token
         ) as client:
-            print(f"Influx: Sending data to InfluxDB @ {self.server_url}")
+            print(f"Influx: Sending data to {self.format_url(None)}")
             client.write(record=data, write_precision=PRECISION)
         return ResponseMock()
 
@@ -266,7 +268,9 @@ class InfluxThread(RESTThread):
             select=self.select,
             **record,
         )
-        return str(line), self.content_type
+        formatted = str(line)
+        print(f"Influx: Requesting {formatted}")
+        return formatted, self.content_type
 
 if __name__ == "__main__":
     from time import time
