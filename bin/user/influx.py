@@ -7,7 +7,6 @@ hardware and software configurations that we need, without many additional featu
 """
 
 from queue import Queue
-from logging import getLogger
 from typing import Union, Any, Optional
 from urllib.request import Request
 from http.client import HTTPResponse
@@ -17,17 +16,16 @@ from weewx import __version__, NEW_ARCHIVE_RECORD, NEW_LOOP_PACKET
 from weewx.restx import RESTThread, FailedPost, StdRESTbase, get_site_dict
 from influxdb_client_3 import InfluxDBClient3
 
-log = getLogger(__name__)
 REQUIRED_CONFIG = ["bucket", "server_url", "api_token", "measurement"]
 ENCODING = "utf-8"
 PRECISION = "s"
 
+# pylint: disable=too-few-public-methods
 class ResponseMock:
     """
     Using the Influx library, we don't get a response object.
     """
     def __init__(self):
-        print("Influx: Mock 204 response object created")
         self.code = 204
     def get_code(self):
         """Stub method to mimic HTTPResponse"""
@@ -251,13 +249,11 @@ class InfluxThread(RESTThread):
         self, request: Request, data: Optional[str] = None
     ) -> HTTPResponse:
         """Make request using client API"""
-        print(f"Influx: Request connection data to {self.format_url(None)}")
         with InfluxDBClient3(
             host=self.server_url,
             database=self.bucket,
             token=self.api_token
         ) as client:
-            print(f"Influx: Sending data to {self.format_url(None)}")
             client.write(record=data, write_precision=PRECISION)
         return ResponseMock()
 
@@ -271,7 +267,6 @@ class InfluxThread(RESTThread):
             **record,
         )
         formatted = str(line)
-        print(f"Influx: Requesting {formatted}")
         return formatted, self.content_type
 
 if __name__ == "__main__":
