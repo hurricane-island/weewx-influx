@@ -68,8 +68,8 @@ class LineProtocol:
             self.tags += "," + ",".join(tags)
 
         def filter_fcn(item: tuple[str, float]):
-            key, _ = item
-            return len(select) == 0 or key in select
+            key, value = item
+            return (len(select) == 0 or key in select) and value is not None
 
         filtered = filter(filter_fcn, kwargs.items())
         data = map(Observation.str_from_item, filtered)
