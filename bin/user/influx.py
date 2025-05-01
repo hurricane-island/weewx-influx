@@ -239,6 +239,11 @@ class InfluxThread(RESTThread):
         super().handle_exception(e, count)
 
     @overrides
+    def format_url(self, _) -> str:
+        """Format URL for InfluxDB Write API"""
+        return f"{self.server_url}/api/v2/write?bucket={self.bucket}&precision={PRECISION}"
+
+    @overrides
     def post_request(
         self, request: Request, data: Optional[str] = None
     ) -> HTTPResponse:
@@ -248,6 +253,7 @@ class InfluxThread(RESTThread):
             database=self.bucket,
             token=self.api_token
         ) as client:
+            print(f"Influx: Sending data to InfluxDB @ {self.server_url}")
             client.write(record=data, write_precision=PRECISION)
         return ResponseMock()
 
